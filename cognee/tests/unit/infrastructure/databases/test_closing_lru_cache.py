@@ -45,6 +45,24 @@ class _AsyncWorker(_Closeable):
         return self.closed
 
 
+class _SlowSubprocessWorker:
+    """Stub modeling a subprocess-backed adapter: it advertises
+    ``_subprocess_mode`` (so its close runs off-loop) and its async close takes
+    measurable time, like tearing down a worker process / releasing a file lock.
+    """
+
+    def __init__(self, name=""):
+        self.name = name
+        self.closed = False
+        self._subprocess_mode = True
+
+    async def close(self):
+        import asyncio
+
+        await asyncio.sleep(0.2)
+        self.closed = True
+
+
 # -- ClosingLRUCache: basic caching -----------------------------------------
 
 
@@ -259,6 +277,108 @@ def test_awaitable_method_holds_lease_after_cache_clear():
         assert closed_during_call is False
         gc.collect()
         assert raw.closed is True
+
+    asyncio.run(run())
+
+
+# -- closing registry: wait-for-in-flight-close ------------------------------
+
+
+def test_leased_entry_active_reflects_eviction():
+    """``_leased_entry_active`` is True while the proxy is the live cache entry
+    and False once the entry is evicted — the signal a pinning caller uses to
+    drop a stale pin and re-resolve instead of holding an evicted worker alive.
+    """
+    cache = ClosingLRUCache(maxsize=4)
+    proxy = cache.get_or_create("k", lambda: _Closeable("a"))
+    assert proxy._leased_entry_active() is True
+    cache.evict("k")
+    assert proxy._leased_entry_active() is False
+
+
+def test_subprocess_close_runs_off_loop_and_is_tracked():
+    """A value advertising ``_subprocess_mode`` closes off the running loop, and
+    the close is registered in the cache's closing registry until it finishes.
+    """
+    import asyncio
+
+    cache = ClosingLRUCache(maxsize=4)
+
+    async def run():
+        proxy = cache.get_or_create("k", lambda: _SlowSubprocessWorker("first"))
+        raw = proxy.__wrapped__
+        cache.evict("k")
+        del proxy
+        gc.collect()
+        # Close started off-loop (still running due to the 0.2s sleep) and is
+        # tracked. The loop is NOT blocked, so the registry entry is visible.
+        assert raw.closed is False
+        assert "k" in cache._closing
+        # Wait for it to finish and confirm the registry self-cleans.
+        await asyncio.sleep(0.4)
+        assert raw.closed is True
+        assert "k" not in cache._closing
+
+    asyncio.run(run())
+
+
+def test_aget_or_create_waits_for_in_flight_close():
+    """A new ``aget_or_create`` for a key whose previous value is still closing
+    must wait for that close to finish before constructing the replacement —
+    this is what prevents a new DB worker from racing a still-shutting-down one
+    for the file lock.
+    """
+    import asyncio
+
+    cache = ClosingLRUCache(maxsize=4)
+
+    async def run():
+        proxy = cache.get_or_create("k", lambda: _SlowSubprocessWorker("first"))
+        raw_first = proxy.__wrapped__
+        cache.evict("k")
+        del proxy
+        gc.collect()
+        assert raw_first.closed is False  # close in flight
+
+        second = await cache.aget_or_create("k", lambda: _SlowSubprocessWorker("second"))
+        # The await must not return until the first close completed.
+        assert raw_first.closed is True
+        assert second.__wrapped__.name == "second"
+
+    asyncio.run(run())
+
+
+def test_aget_or_create_cache_hit_is_fast_path():
+    """``aget_or_create`` returns the cached value without constructing when the
+    key is present (and never blocks on the closing registry for a live entry).
+    """
+    import asyncio
+
+    cache = ClosingLRUCache(maxsize=4)
+
+    async def run():
+        first = cache.get_or_create("k", lambda: _Closeable("first"))
+        second = await cache.aget_or_create("k", lambda: _Closeable("second"))
+        assert first is second
+        assert second.name == "first"
+
+    asyncio.run(run())
+
+
+def test_decorator_acall_shares_key_with_sync_call():
+    """``acall`` builds the same cache key as the sync wrapper, so an async
+    acquisition and a sync call for the same args resolve to one object.
+    """
+    import asyncio
+
+    @closing_lru_cache(maxsize=4)
+    def create(key):
+        return _Closeable(key)
+
+    async def run():
+        a = await create.acall("x")
+        b = create("x")
+        assert a is b
 
     asyncio.run(run())
 
