@@ -24,6 +24,15 @@ class _VectorEngineHandle:
 
     __slots__ = ("_config", "_pinned")
 
+    # Note: unlike ``_GraphEngineHandle`` there is intentionally no async
+    # resolution path here. ``get_vector_engine()`` is synchronous, and the
+    # subprocess vector backend (LanceDB) connects via ``connect_async`` without
+    # taking an exclusive on-disk file lock the way Kuzu/Ladybug does — so the
+    # create-vs-close lock race that motivates the graph handle's
+    # await-the-in-flight-close path does not apply. The detach-aware pin below
+    # is mirrored purely for consistency (avoid re-entering the cache on every
+    # attribute access; don't keep an evicted worker pinned alive).
+
     def __init__(self, config: dict):
         object.__setattr__(self, "_config", config)
         # Pinned leased engine proxy — see ``_GraphEngineHandle`` for the

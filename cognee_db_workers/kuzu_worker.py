@@ -32,7 +32,7 @@ from .kuzu_protocol import (
 _LOCK_HELD_MARKER = "could not set lock on file"
 
 
-def _retry_open_locked(ladybug, kwargs):
+def _retry_open_locked(ladybug, kwargs, original_exc):
     """Re-attempt ``ladybug.Database(**kwargs)`` after an initial lock-held
     failure, with bounded exponential backoff.
 
@@ -41,14 +41,18 @@ def _retry_open_locked(ladybug, kwargs):
     whose close is driven by a GC finalizer and so can't be cleanly awaited by
     the creator). The OS frees a dead process's file locks immediately, so once
     the previous worker exits the next attempt succeeds. Only the lock-held
-    error is retried; any other ``RuntimeError`` propagates unchanged. Re-raises
-    the last lock error if every attempt is exhausted.
+    error is retried; any other ``RuntimeError`` propagates unchanged.
+
+    ``original_exc`` is the first lock-held failure the caller already saw; it is
+    re-raised when retries are exhausted — or immediately when retries are
+    disabled (``SUBPROCESS_OPEN_LOCK_RETRIES <= 0``), so a misconfigured value
+    surfaces the real lock error instead of a spurious ``TypeError``.
     """
     import time
 
     from .harness import OPEN_LOCK_BACKOFF, OPEN_LOCK_RETRIES
 
-    last_exc = None
+    last_exc = original_exc
     for attempt in range(OPEN_LOCK_RETRIES):
         # Backoff first — the caller already saw one failure. Cap per-attempt so
         # exponential growth stays bounded (≈ a few seconds total by default).
@@ -75,7 +79,7 @@ def _open_database(registry: HandleRegistry, req: Request) -> HandleResult:
             # Transient inter-process lock contention with another worker that
             # is still shutting down for the same path — retry with backoff
             # rather than treating it as corruption/migration.
-            db = _retry_open_locked(ladybug, req.kwargs)
+            db = _retry_open_locked(ladybug, req.kwargs, e)
         else:
             if "wal" in message:
                 # In case of corrupted WAL file preventing database opening, remove the WAL file and try again

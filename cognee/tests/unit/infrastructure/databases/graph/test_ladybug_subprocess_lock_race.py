@@ -73,3 +73,27 @@ async def test_sync_recreate_after_evict_no_lock_error(tmp_path):
         await _evict_after_use(cfg, use_async=False)
     engine = create_graph_engine(**cfg)
     await engine.close()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_worker_process_exit(tmp_path):
+    """``close()`` must not return until the worker process has actually exited
+    (and thus released its on-disk file lock) — the guarantee that lets a new
+    worker open the same path immediately afterwards."""
+    cfg = _config(tmp_path)
+    engine = create_graph_engine(**cfg)
+    await engine.query("MATCH (n) RETURN 1 LIMIT 1")
+    pid = engine._session.pid
+    assert _pid_alive(pid)
+
+    await engine.close()
+
+    assert not _pid_alive(pid), f"worker pid {pid} still alive after close()"

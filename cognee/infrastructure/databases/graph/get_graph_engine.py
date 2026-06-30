@@ -78,6 +78,20 @@ class _GraphEngineHandle:
     For adapters that expose ``initialize()`` (Postgres, Neo4j), the handle
     tracks which engine proxy was last initialized and re-runs the idempotent
     schema setup when the underlying engine changes.
+
+    Known limitation (subprocess + exclusive file lock, e.g. Ladybug): the cache
+    leases a single shared proxy per entry, so two concurrently-held handles for
+    the same DB path pin the *same* proxy. If that entry is evicted while one
+    handle keeps holding it and never re-resolves (a long-lived, idle second
+    handle), the old worker's close stays deferred — it does not release the
+    file lock, and a fresh engine for the same path falls back to the worker's
+    open-retry (``SUBPROCESS_OPEN_LOCK_RETRIES``) rather than the deterministic
+    await-the-close path. This is inherent to "one exclusive lock per path with
+    concurrent live holders" and is narrow in practice: the primary multi-tenant
+    teardown path (``dataset_queue._teardown_subprocess_engines``) ``await``s
+    ``engine.close()`` to completion before any re-creation, and a handle that is
+    accessed again or garbage-collected drops its stale pin and converges. A
+    permanently-idle second handle is the only unrescued case.
     """
 
     __slots__ = ("_config", "_last_initialized_id", "_pinned")

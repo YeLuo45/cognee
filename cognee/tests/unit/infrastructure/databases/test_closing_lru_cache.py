@@ -4,6 +4,7 @@ import gc
 
 from cognee.infrastructure.databases.utils.closing_lru_cache import (
     ClosingLRUCache,
+    _start_close,
     closing_lru_cache,
 )
 
@@ -61,6 +62,24 @@ class _SlowSubprocessWorker:
 
         await asyncio.sleep(0.2)
         self.closed = True
+
+
+class _ThreadRecordingWorker:
+    """Records the thread name its async close ran on. Used to assert the
+    loop-vs-off-loop branch in ``_start_close``: subprocess-backed values
+    (``_subprocess_mode``) close on a pool thread; everything else closes on the
+    running loop's thread.
+    """
+
+    def __init__(self, subprocess_mode):
+        self.closed_on = None
+        if subprocess_mode:
+            self._subprocess_mode = True
+
+    async def close(self):
+        import threading
+
+        self.closed_on = threading.current_thread().name
 
 
 # -- ClosingLRUCache: basic caching -----------------------------------------
@@ -361,6 +380,69 @@ def test_aget_or_create_cache_hit_is_fast_path():
         second = await cache.aget_or_create("k", lambda: _Closeable("second"))
         assert first is second
         assert second.name == "first"
+
+    asyncio.run(run())
+
+
+def test_aget_or_create_concurrent_callers_single_construction():
+    """Many coroutines racing ``aget_or_create`` for the same just-evicted key
+    must all wait on the one in-flight close and then resolve to a single newly
+    constructed value — no thundering-herd of duplicate workers."""
+    import asyncio
+
+    cache = ClosingLRUCache(maxsize=4)
+
+    async def run():
+        proxy = cache.get_or_create("k", lambda: _SlowSubprocessWorker("first"))
+        raw_first = proxy.__wrapped__
+        cache.evict("k")
+        del proxy
+        gc.collect()
+        assert raw_first.closed is False  # close in flight
+
+        constructed = []
+
+        def factory():
+            w = _SlowSubprocessWorker("new")
+            constructed.append(w)
+            return w
+
+        results = await asyncio.gather(*[cache.aget_or_create("k", factory) for _ in range(10)])
+
+        assert len(constructed) == 1, "exactly one new value should be constructed"
+        assert all(r.__wrapped__ is results[0].__wrapped__ for r in results)
+        assert raw_first.closed is True  # old close completed before construction
+
+    asyncio.run(run())
+
+
+def test_start_close_subprocess_runs_off_loop_others_on_loop():
+    """``_start_close`` runs a ``_subprocess_mode`` value's close on a dedicated
+    pool thread (so a loop-blocking sync re-resolution can't wedge lock release)
+    while a plain async-close value (e.g. a SQLAlchemy-backed adapter) stays on
+    the running loop — preserving loop-bound resource semantics."""
+    import asyncio
+    import threading
+
+    async def run():
+        loop_thread = threading.current_thread().name
+
+        sub = _ThreadRecordingWorker(subprocess_mode=True)
+        fut = _start_close(sub)
+        assert fut is not None
+        await asyncio.wrap_future(fut)
+        assert sub.closed_on is not None
+        assert sub.closed_on.startswith("closing-lru-close"), (
+            f"subprocess close ran on {sub.closed_on}, expected a pool thread"
+        )
+
+        normal = _ThreadRecordingWorker(subprocess_mode=False)
+        _start_close(normal)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert normal.closed_on == loop_thread, (
+            f"non-subprocess close ran on {normal.closed_on}, expected the loop thread"
+        )
 
     asyncio.run(run())
 
